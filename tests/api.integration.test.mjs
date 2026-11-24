@@ -52,6 +52,34 @@ async function published(){const photo=await uploadPhoto();const draft=await cre
 async function requestFor(listing,user){use(user);const response=await api.requestCreate.POST(req(`/api/listings/${listing.id}/requests`,"POST",{companyName:"テスト受取企業",message:"軽バンと2名で運びます。",pickupAt:new Date(Date.parse(listing.pickupStart)+3600000).toISOString(),conditionsAccepted:true}),context(listing.id));assert.equal(response.status,201,await response.clone().text());return(await response.json()).request;}
 after(()=>sqlite?.close());
 
+test("listing capacity remains 30 when several saves arrive together and released capacity is reusable",async()=>{
+  reset(true);use(seller);
+  const responses=await Promise.all(Array.from({length:35},()=>api.listings.POST(req("/api/listings","POST",input()))));
+  assert.equal(responses.filter(r=>r.status===201).length,30);
+  assert.equal(responses.filter(r=>r.status===429).length,5);
+  assert.equal(sqlite.prepare("SELECT COUNT(*) AS n FROM listings").get().n,30);
+  const first=sqlite.prepare("SELECT id FROM listings LIMIT 1").get();
+  assert.equal((await api.listing.PATCH(req(`/api/listings/${first.id}`,"PATCH",{action:"withdraw"}),context(first.id))).status,200);
+  assert.equal((await api.listings.POST(req("/api/listings","POST",input()))).status,201);
+  assert.equal(sqlite.prepare("SELECT COUNT(*) AS n FROM listings WHERE status NOT IN ('completed','withdrawn')").get().n,30);
+});
+
+test("daily request capacity is atomic and becomes available after the window expires",async()=>{
+  reset(true);
+  const start=new Date(Date.now()+7*86400000).toISOString();const end=new Date(Date.parse(start)+7200000).toISOString();const now=new Date().toISOString();
+  // Test fixtures only: independent listings, so the per-listing uniqueness rule does not mask the daily limit.
+  for(let i=0;i<35;i++)sqlite.prepare("INSERT INTO listings(id,owner_id,owner_email,title,category,price_jpy,quantity,width_cm,depth_cm,height_cm,weight_kg,condition,venue,address_area,pickup_start,pickup_end,description,transport,disassembly,image_url,company_name,status,rights_confirmed_at,terms_version,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(`capacity-${i}`,seller.userId,seller.email,"展示台","display",1000,1,10,10,10,1,"good","会場","東京",start,end,"テスト用展示台","van","none","","企業","published",now,"test",now,now);
+  use(buyerA);
+  const submit=i=>api.requestCreate.POST(req(`/api/listings/capacity-${i}/requests`,"POST",{companyName:"テスト受取企業",message:"軽バンと2名で運びます。",pickupAt:new Date(Date.parse(start)+3600000).toISOString(),conditionsAccepted:true}),context(`capacity-${i}`));
+  const responses=await Promise.all(Array.from({length:35},(_,i)=>submit(i)));
+  assert.equal(responses.filter(r=>r.status===201).length,30);
+  assert.equal(responses.filter(r=>r.status===429).length,5);
+  assert.equal(sqlite.prepare("SELECT COUNT(*) AS n FROM requests").get().n,30);
+  const rejected=responses.findIndex(r=>r.status===429);
+  sqlite.prepare("UPDATE requests SET created_at=?").run(new Date(Date.now()-25*3600000).toISOString());
+  assert.equal((await submit(rejected)).status,201);
+});
+
 test("anonymous writes are rejected and a stranger cannot collect data in preview",async()=>{
   reset();
   let response=await api.listings.POST(req("/api/listings","POST",input()));assert.equal(response.status,401);
